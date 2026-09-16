@@ -1,6 +1,6 @@
 import http from "node:http";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -102,19 +102,20 @@ function migrate(db) {
   return changed;
 }
 
+// 每次写入使用独立临时文件，并发保存互不踩踏；失败时清理临时文件，不残留半写数据
+let tmpCounter = 0;
 async function saveDb(dbPath, db) {
-  const tmp = dbPath + ".tmp";
-  await writeFile(tmp, JSON.stringify(db, null, 2));
-  await rename(tmp, dbPath);
-}
-async function loadDb(dbPath) {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await saveDb(dbPath, seed);
+  const tmp = `${dbPath}.${process.pid}.${tmpCounter++}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(db, null, 2));
+    await rename(tmp, dbPath);
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
   }
-  const db = JSON.parse(await readFile(dbPath, "utf8"));
-  if (migrate(db)) await saveDb(dbPath, db);
-  return db;
+}
+async function readDb(dbPath) {
+  return JSON.parse(await readFile(dbPath, "utf8"));
 }
 async function body(req) {
   const chunks = [];
@@ -589,11 +590,30 @@ function page() {
 
 export function createApp(options = {}) {
   const dbPath = options.dbPath || process.env.DB_PATH || defaultDbPath;
+  // 初始化与迁移只安全成功一次：并发首读共享同一 Promise，失败可重试且不留半写数据
+  let ready = null;
+  function ensureReady() {
+    if (!ready) {
+      ready = (async () => {
+        if (!existsSync(dbPath)) {
+          await mkdir(dirname(dbPath), { recursive: true });
+          await saveDb(dbPath, seed);
+        }
+        const db = await readDb(dbPath);
+        if (migrate(db)) await saveDb(dbPath, db);
+      })().catch(error => { ready = null; throw error; });
+    }
+    return ready;
+  }
+  async function loadDb() {
+    await ensureReady();
+    return readDb(dbPath);
+  }
   // 串行化所有写操作：校验-变更-落库在同一微任务链内完成，并发与重复请求只有一次能生效
   let chain = Promise.resolve();
   function mutate(fn) {
     const p = chain.then(async () => {
-      const db = await loadDb(dbPath);
+      const db = await loadDb();
       const out = await fn(db);
       await saveDb(dbPath, db);
       return out;
@@ -631,7 +651,7 @@ export function createApp(options = {}) {
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (req.method === "GET") {
-        const db = await loadDb(dbPath);
+        const db = await loadDb();
         if (url.pathname === "/") return html(res, page());
         if (url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
         if (url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
