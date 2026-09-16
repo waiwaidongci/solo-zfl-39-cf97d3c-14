@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -60,8 +61,30 @@ function requireFields(input, fieldLabels) {
   const missing = Object.entries(fieldLabels).filter(([key]) => !s(input[key])).map(([, label]) => label);
   if (missing.length) throw bad("缺少必填字段: " + missing.join("、"), { missing });
 }
+// 只接受真实存在的日历日期（YYYY-MM-DD），拒绝 2026-02-30、2026-13-01 之类
+function isCalendarDate(str) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  if (!m) return false;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return dt.getUTCFullYear() === year && dt.getUTCMonth() === month - 1 && dt.getUTCDate() === day;
+}
+function requireDate(input, key, label) {
+  if (!isCalendarDate(s(input[key]))) throw bad(label + "必须是真实存在的日历日期（YYYY-MM-DD）");
+}
+// 幂等键按操作范围隔离：方法 + 路径 + 规范化请求体 的指纹一致才允许回放
+function canonical(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map(k => JSON.stringify(k) + ":" + canonical(value[k])).join(",") + "}";
+  }
+  return JSON.stringify(value ?? null);
+}
+function requestFingerprint(method, path, input) {
+  return createHash("sha256").update(method + " " + path + " " + canonical(input)).digest("hex");
+}
 
-// 升级迁移：保留已有台账，历史项标“待复核”，绝不自动关闭任何记录
+// 升级迁移：保留已有台账、审核、不符合项与幂等数据，历史项标“待复核”，绝不自动关闭任何记录
 function migrate(db) {
   let changed = false;
   if (!Array.isArray(db.items)) { db.items = []; changed = true; }
@@ -71,7 +94,11 @@ function migrate(db) {
   if (!Array.isArray(db.audits)) { db.audits = []; changed = true; }
   if (!Array.isArray(db.nonconformities)) { db.nonconformities = []; changed = true; }
   if (!db.idempotency || typeof db.idempotency !== "object" || Array.isArray(db.idempotency)) { db.idempotency = {}; changed = true; }
-  if (db.schemaVersion !== 2) { db.schemaVersion = 2; changed = true; }
+  // 旧版幂等记录没有请求指纹，标记为 legacy：保留不丢失，但因无法校验请求一致性，一律不得回放
+  for (const rec of Object.values(db.idempotency)) {
+    if (rec && typeof rec === "object" && !rec.fingerprint && !rec.legacy) { rec.legacy = true; changed = true; }
+  }
+  if (db.schemaVersion !== 3) { db.schemaVersion = 3; changed = true; }
   return changed;
 }
 
@@ -145,6 +172,8 @@ function pushHistory(nc, action, by, note, extra) {
 
 function createAudit(db, input) {
   requireFields(input, { standardVersion: "标准版本", scope: "审核范围", auditor: "审核员", startDate: "开始日期" });
+  requireDate(input, "startDate", "开始日期");
+  if (s(input.endDate)) requireDate(input, "endDate", "结束日期");
   if (s(input.endDate) && s(input.endDate) < s(input.startDate)) throw bad("结束日期不能早于开始日期");
   const samples = (Array.isArray(input.samples) ? input.samples : []).map(key => {
     const item = findItem(db, key);
@@ -179,10 +208,10 @@ function transitionAudit(db, id, input) {
 
 function registerNc(db, auditId, input) {
   const audit = findAudit(db, auditId);
-  if (audit.status === "已完成") throw conflict("invalid_status", "审核计划已完成，不能登记不符合项");
+  if (audit.status !== "审核中") throw conflict("invalid_status", "只有审核中的计划才能登记不符合项（当前为「" + audit.status + "」）");
   requireFields(input, { clause: "条款", severity: "严重度", evidence: "证据", responsible: "责任人", deadline: "整改期限", batch: "样本批次" });
   if (!SEVERITIES.includes(input.severity)) throw bad("严重度必须是: " + SEVERITIES.join("/"));
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s(input.deadline))) throw bad("整改期限格式应为 YYYY-MM-DD");
+  requireDate(input, "deadline", "整改期限");
   const item = findItem(db, input.batch);
   if (!item) throw bad("样本批次不存在: " + input.batch);
   const batchKey = item.code || item.id;
@@ -480,7 +509,9 @@ function page() {
       qStatsEl.innerHTML = NC_STATUSES.map(st => '<div class="stat"><span>'+st+'</span><strong>'+ncs.filter(n => n.status === st).length+'</strong></div>').join('');
       const auditSel = document.querySelector('#ncAudit');
       const keep = auditSel.value;
-      auditSel.innerHTML = audits.filter(a => a.status !== '已完成').map(a => '<option value="'+a.id+'">'+esc(a.scope)+' · '+esc(a.standardVersion)+'（'+a.status+'）</option>').join('');
+      const registerable = audits.filter(a => a.status === '审核中');
+      auditSel.innerHTML = registerable.map(a => '<option value="'+a.id+'">'+esc(a.scope)+' · '+esc(a.standardVersion)+'（'+a.status+'）</option>').join('')
+        || '<option value="">（暂无审核中的计划，请先开始审核）</option>';
       if (keep) auditSel.value = keep;
       renderBatchOptions();
       document.querySelector('#sampleSelect').innerHTML = items.map(it => '<option value="'+(it.code || it.id)+'">'+(it.code || it.id)+' · '+(it.source || '')+'</option>').join('');
@@ -499,6 +530,7 @@ function page() {
     ncForm.onsubmit = async event => {
       event.preventDefault();
       const fd = new FormData(ncForm);
+      if (!fd.get('auditId')) { alert('没有审核中的计划，请先在上方创建并「开始审核」'); return; }
       await qapi('/api/audits/'+fd.get('auditId')+'/nonconformities', { method:'POST', body: JSON.stringify({ batch: fd.get('batch'), clause: fd.get('clause'), severity: fd.get('severity'), evidence: fd.get('evidence'), responsible: fd.get('responsible'), deadline: fd.get('deadline'), description: fd.get('description') }) });
       ncForm.reset(); await qload();
     };
@@ -569,14 +601,24 @@ export function createApp(options = {}) {
     chain = p.catch(() => {});
     return p;
   }
-  async function handleMutation(req, res, fn) {
+  async function handleMutation(req, res, path, fn) {
     try {
       const input = await body(req);
       const idemKey = req.headers["idempotency-key"];
+      const fingerprint = idemKey ? requestFingerprint(req.method, path, input) : null;
       const out = await mutate(async (db) => {
-        if (idemKey && db.idempotency[idemKey]) return { ...db.idempotency[idemKey], replay: true };
+        if (idemKey) {
+          const rec = db.idempotency[idemKey];
+          if (rec && typeof rec === "object") {
+            // 同一操作同一请求：回放原响应；不同接口/不同内容或无法校验的遗留记录：拒绝，绝不误回放
+            if (rec.fingerprint && rec.fingerprint === fingerprint) {
+              return { status: rec.status, body: rec.body, replay: true };
+            }
+            throw new HttpError(409, "idempotency_conflict", "幂等键已被其他请求占用，请更换新键");
+          }
+        }
         const result = await fn(db, input);
-        if (idemKey) db.idempotency[idemKey] = { status: result.status, body: result.body, at: now() };
+        if (idemKey) db.idempotency[idemKey] = { fingerprint, status: result.status, body: result.body, at: now() };
         return result;
       });
       send(res, out.status, out.body, out.replay ? { "Idempotent-Replay": "true" } : undefined);
@@ -626,7 +668,7 @@ export function createApp(options = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/api/items") {
-        return handleMutation(req, res, async (db, input) => {
+        return handleMutation(req, res, url.pathname, async (db, input) => {
           const item = { id: uid("PF"), ...input, reviewStatus: "待复核", logs: [{ at: now(), step: "建档", note: "创建纸浆批次" }] };
           db.items.unshift(item);
           return { status: 201, body: item };
@@ -634,7 +676,7 @@ export function createApp(options = {}) {
       }
       const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
       if (patch && req.method === "PATCH") {
-        return handleMutation(req, res, async (db, input) => {
+        return handleMutation(req, res, url.pathname, async (db, input) => {
           const item = findItem(db, patch[1]);
           if (!item) throw notFound("批次");
           Object.assign(item, input);
@@ -645,7 +687,7 @@ export function createApp(options = {}) {
       }
       const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
       if (log && req.method === "POST") {
-        return handleMutation(req, res, async (db, input) => {
+        return handleMutation(req, res, url.pathname, async (db, input) => {
           const item = findItem(db, log[1]);
           if (!item) throw notFound("批次");
           item.logs ||= [];
@@ -655,7 +697,7 @@ export function createApp(options = {}) {
       }
       const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
       if (action && req.method === "POST") {
-        return handleMutation(req, res, async (db, input) => {
+        return handleMutation(req, res, url.pathname, async (db, input) => {
           const item = findItem(db, action[1]);
           if (!item) throw notFound("批次");
           item.logs ||= [];
@@ -669,19 +711,19 @@ export function createApp(options = {}) {
         });
       }
       if (req.method === "POST" && url.pathname === "/api/audits") {
-        return handleMutation(req, res, async (db, input) => ({ status: 201, body: createAudit(db, input) }));
+        return handleMutation(req, res, url.pathname, async (db, input) => ({ status: 201, body: createAudit(db, input) }));
       }
       const auditPatch = url.pathname.match(/^\/api\/audits\/([^/]+)$/);
       if (auditPatch && req.method === "PATCH") {
-        return handleMutation(req, res, async (db, input) => ({ status: 200, body: transitionAudit(db, auditPatch[1], input) }));
+        return handleMutation(req, res, url.pathname, async (db, input) => ({ status: 200, body: transitionAudit(db, auditPatch[1], input) }));
       }
       const ncRegister = url.pathname.match(/^\/api\/audits\/([^/]+)\/nonconformities$/);
       if (ncRegister && req.method === "POST") {
-        return handleMutation(req, res, async (db, input) => ({ status: 201, body: registerNc(db, ncRegister[1], input) }));
+        return handleMutation(req, res, url.pathname, async (db, input) => ({ status: 201, body: registerNc(db, ncRegister[1], input) }));
       }
       const ncAction = url.pathname.match(/^\/api\/nonconformities\/([^/]+)\/(submit|review|close|reopen|corrections)$/);
       if (ncAction && req.method === "POST") {
-        return handleMutation(req, res, async (db, input) => {
+        return handleMutation(req, res, url.pathname, async (db, input) => {
           const [, id, act] = ncAction;
           if (act === "submit") return { status: 200, body: submitRectification(db, id, input) };
           if (act === "review") return { status: 200, body: reviewNc(db, id, input) };

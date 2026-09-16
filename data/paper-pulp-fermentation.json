@@ -36,5 +36,5 @@
   "audits": [],
   "nonconformities": [],
   "idempotency": {},
-  "schemaVersion": 2
+  "schemaVersion": 3
 }
