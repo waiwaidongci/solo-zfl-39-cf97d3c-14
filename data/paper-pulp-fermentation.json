@@ -29,7 +29,12 @@
           "changedWater": "是",
           "abnormal": false
         }
-      ]
+      ],
+      "reviewStatus": "待复核"
     }
-  ]
+  ],
+  "audits": [],
+  "nonconformities": [],
+  "idempotency": {},
+  "schemaVersion": 2
 }
